@@ -1,0 +1,255 @@
+name: Custom Signed Build
+
+# Builds a self-signed KernelSU set: kernelsu.ko + ksuinit + ksud + manager APK,
+# all carrying the same package name. The certificate size and SHA-256 are
+# derived from the KEYSTORE secret so the kernel module and the APK stay paired.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kmi:
+        description: 'Target KMI (e.g. android16-6.12)'
+        required: true
+        default: 'android16-6.12'
+      package_name:
+        description: 'Manager applicationId'
+        required: true
+        default: 'com.jian.oio'
+      app_name:
+        description: 'Manager app label'
+        required: true
+        default: 'oio'
+      ddk_release:
+        description: 'DDK release tag'
+        required: true
+        default: '20260828'
+
+permissions:
+  contents: read
+
+jobs:
+  cert:
+    name: Derive cert size and hash
+    runs-on: ubuntu-latest
+    outputs:
+      expected_size: ${{ steps.derive.outputs.expected_size }}
+      expected_hash: ${{ steps.derive.outputs.expected_hash }}
+    steps:
+      - name: Derive from keystore
+        id: derive
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+          STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64" || { echo "ERROR: KEYSTORE secret is empty"; exit 1; }
+          tmp="$(mktemp -d)"
+          echo "$KEYSTORE_B64" | base64 -d > "$tmp/key.jks"
+          keytool -exportcert -alias "$KEY_ALIAS" -keystore "$tmp/key.jks" \
+            -storepass "$STORE_PASS" -file "$tmp/cert.der"
+          size="$(stat -c%s "$tmp/cert.der")"
+          hash="$(sha256sum "$tmp/cert.der" | cut -d' ' -f1)"
+          printf 'expected_size=0x%04x\n' "$size" >> "$GITHUB_OUTPUT"
+          printf 'expected_hash=%s\n' "$hash" >> "$GITHUB_OUTPUT"
+          echo "certificate DER size : $size bytes"
+          echo "certificate SHA-256  : $hash"
+
+  lkm:
+    name: Build kernelsu.ko
+    needs: cert
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ inputs.kmi }}-${{ inputs.ddk_release }}
+      options: --privileged
+    env:
+      KMI: ${{ inputs.kmi }}
+      PKG_NAME: ${{ inputs.package_name }}
+      EXPECTED_SIZE: ${{ needs.cert.outputs.expected_size }}
+      EXPECTED_HASH: ${{ needs.cert.outputs.expected_hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build kernelsu.ko
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cd kernel
+          echo "KMI=$KMI package=$PKG_NAME size=$EXPECTED_SIZE hash=$EXPECTED_HASH"
+          CONFIG_KSU=m CC=clang make \
+            KSU_PACKAGE_NAME="$PKG_NAME" \
+            KSU_EXPECTED_SIZE="$EXPECTED_SIZE" \
+            KSU_EXPECTED_HASH="$EXPECTED_HASH" \
+            KSU_IS_PR_BUILD=0
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp kernelsu.ko "$GITHUB_WORKSPACE/out/${KMI}_kernelsu.ko"
+          llvm-strip -d "$GITHUB_WORKSPACE/out/${KMI}_kernelsu.ko"
+          ls -l "$GITHUB_WORKSPACE/out"
+
+      - name: Upload lkm
+        uses: actions/upload-artifact@v7
+        with:
+          name: custom-lkm
+          path: out/*.ko
+          if-no-files-found: error
+
+  ksuinit:
+    name: Build ksuinit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup rustup
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Build ksuinit
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          test -f "$BUILTINS"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+          cargo build --package ksuinit --target=aarch64-linux-android --release
+
+      - name: Upload ksuinit
+        uses: actions/upload-artifact@v7
+        with:
+          name: custom-ksuinit
+          path: target/aarch64-linux-android/release/ksuinit
+          if-no-files-found: error
+
+  ksud:
+    name: Build ksud
+    needs: [lkm, ksuinit]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download lkm
+        uses: actions/download-artifact@v8
+        with:
+          name: custom-lkm
+          path: lkm
+
+      - name: Download ksuinit
+        uses: actions/download-artifact@v8
+        with:
+          name: custom-ksuinit
+          path: ksuinit
+
+      - name: Place embedded assets
+        run: |
+          set -euo pipefail
+          ls -l lkm ksuinit
+          cp lkm/*.ko userspace/ksud/bin/aarch64/
+          cp ksuinit/ksuinit userspace/ksud/bin/aarch64/
+          ls -l userspace/ksud/bin/aarch64/
+
+      - name: Setup rustup
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Build ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          KSU_PACKAGE_NAME: ${{ inputs.package_name }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo build --target aarch64-linux-android --release \
+            --manifest-path ./userspace/ksud/Cargo.toml
+          ls -l target/aarch64-linux-android/release/ksud
+
+      - name: Upload ksud
+        uses: actions/upload-artifact@v7
+        with:
+          name: custom-ksud
+          path: target/aarch64-linux-android/release/ksud
+          if-no-files-found: error
+
+  manager:
+    name: Build manager APK
+    needs: ksud
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download ksud
+        uses: actions/download-artifact@v8
+        with:
+          name: custom-ksud
+          path: ksud
+
+      - name: Place ksud into jniLibs
+        run: |
+          set -euo pipefail
+          mkdir -p manager/app/src/main/jniLibs/arm64-v8a
+          cp ksud/ksud manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          chmod +x manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          ls -l manager/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Write signing config
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+          STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE_B64" | base64 -d > manager/key.jks
+          {
+            echo "KEYSTORE_PASSWORD=$STORE_PASS"
+            echo "KEY_ALIAS=$KEY_ALIAS"
+            echo "KEY_PASSWORD=$KEY_PASS"
+            echo "KEYSTORE_FILE=key.jks"
+          } >> manager/gradle.properties
+
+      - name: Build APK
+        working-directory: manager
+        run: |
+          ./gradlew clean assembleRelease \
+            -PKSU_PACKAGE_NAME=${{ inputs.package_name }} \
+            -PKSU_NAME=${{ inputs.app_name }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: custom-manager
+          path: manager/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
