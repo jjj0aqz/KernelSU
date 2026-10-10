@@ -71,12 +71,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Apply local patch
+      - name: Apply local patches
         run: |
           set -eu
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git apply --check -v .github/patches/selinux-timing.patch
-          git apply -v .github/patches/selinux-timing.patch
+          for p in .github/patches/*.patch; do
+            [ -e "$p" ] || continue
+            echo "==> applying $p"
+            git apply --check -v "$p"
+            git apply -v "$p"
+          done
           git diff --stat
 
       - name: Build kernelsu.ko
