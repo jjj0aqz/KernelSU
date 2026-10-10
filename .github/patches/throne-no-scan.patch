@@ -1,0 +1,45 @@
+diff --git a/kernel/manager/throne_tracker.c b/kernel/manager/throne_tracker.c
+index a827212..a193ce1 100644
+--- a/kernel/manager/throne_tracker.c
++++ b/kernel/manager/throne_tracker.c
+@@ -306,7 +306,6 @@ void track_throne(bool prune_only)
+     }
+ 
+     if (manager_package_uid == KSU_INVALID_APPID) {
+-        cached_manager_apk_path[0] = 0;
+         if (ksu_is_manager_appid_valid()) {
+             pr_info("manager is uninstalled, invalidate it!\n");
+             ksu_invalidate_manager_uid();
+@@ -318,7 +317,6 @@ void track_throne(bool prune_only)
+         } else if (unlikely(np->uid != ksu_get_manager_appid())) {
+             // this should not happen in normal android system
+             pr_info("manager uid changed, invalidate it!\n");
+-            cached_manager_apk_path[0] = 0;
+             ksu_invalidate_manager_uid();
+             need_rescan = true;
+         } else {
+@@ -328,14 +326,21 @@ void track_throne(bool prune_only)
+     }
+ 
+     if (need_rescan) {
+-        // If the apk path still exists, the verification result won't be changed
++        /*
++         * Prefer the cached apk path over walking /data/app. The walk opens
++         * every app's package directory, and any app can trigger it by
++         * rewriting /data/system/packages.list, so the traversal itself is a
++         * fingerprint. The cached path is only reused when the apk is still
++         * there and still passes signature verification.
++         */
+         if (cached_manager_apk_path[0]) {
+             struct path p;
+             int ret = kern_path(cached_manager_apk_path, 0, &p);
+             if (ret == 0) {
+-                // skip search
+-                pr_info("manager apk path unchanged, skip search!\n");
+                 path_put(&p);
++                pr_info("manager apk path unchanged, re-crown from cache\n");
++                if (is_manager_apk(cached_manager_apk_path))
++                    crown_manager(cached_manager_apk_path, &uid_list);
+                 goto prune;
+             } else if (ret != -ENOENT) {
+                 pr_err("stat cached manager path failed: %d (path=%s)\n", ret, cached_manager_apk_path);
