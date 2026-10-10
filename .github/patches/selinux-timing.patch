@@ -1,0 +1,70 @@
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+index 033cab8..b76e76f 100644
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -234,6 +234,9 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+     int error, perm_error;
+     u32 mysid, sid;
+     char *str = value;
++    bool enforce;
++    const char *probe;
++    size_t probe_len;
+     if (likely(current_uid().val < 10000)) {
+         goto call_orig;
+     }
+@@ -241,25 +244,46 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+     if (strcmp(name, "current")) {
+         goto call_orig;
+     }
+-    if (size && str[0] && str[0] != '\n') {
++
++    if (!size || !str[0]) {
++        goto call_orig;
++    }
++
++    /*
++     * A payload that starts with a newline resets the context and is not
++     * validated; any other payload is resolved against the backup policy.
++     * Both shapes still run the very same probe below: if only the validated
++     * shape did the lookup, the difference in execution time would be
++     * observable from userspace and could be used to fingerprint the hook.
++     */
++    enforce = str[0] != '\n';
++    probe = str;
++    probe_len = size;
++
++    if (enforce) {
+         if (str[size - 1] == '\n') {
+             str[size - 1] = 0;
++            probe_len--;
+             size--;
+         }
++    } else {
++        probe++;
++        probe_len--;
++    }
++
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+-        error = security_context_to_sid_with_policy(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL);
++    error = security_context_to_sid_with_policy(backup_sepolicy, probe, probe_len, &sid, SECSID_NULL, GFP_KERNEL);
+ #else
+-        error = security_context_to_sid(&fake_state, str, size, &sid, GFP_KERNEL);
++    error = security_context_to_sid(&fake_state, probe, probe_len, &sid, GFP_KERNEL);
+ #endif
+-        if (error) {
+-            mysid = current_sid();
++    if (enforce && error) {
++        mysid = current_sid();
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+-            perm_error = avc_has_perm(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
++        perm_error = avc_has_perm(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
+ #else
+-            perm_error = avc_has_perm(&selinux_state, mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
++        perm_error = avc_has_perm(&selinux_state, mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
+ #endif
+-            return perm_error ?: error;
+-        }
++        return perm_error ?: error;
+     }
+ 
+ call_orig:
