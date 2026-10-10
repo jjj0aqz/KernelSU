@@ -71,6 +71,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Apply local patch
+        run: |
+          set -eu
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git apply --check -v .github/patches/selinux-timing.patch
+          git apply -v .github/patches/selinux-timing.patch
+          git diff --stat
+
       - name: Build kernelsu.ko
         run: |
           set -euo pipefail
