@@ -1,22 +1,50 @@
 diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
-index 033cab8..b76e76f 100644
+index 033cab8..0ba3e66 100644
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -234,6 +234,9 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -14,6 +14,7 @@
+ #include <net/genetlink.h>
+ #include <linux/moduleparam.h>
+ #include <linux/mutex.h>
++#include <linux/sched/clock.h>
+ // security/selinux/include/security.h
+ #include <security.h>
+ #include <ss/context.h>
+@@ -228,12 +229,27 @@ out:
+ static int my_setprocattr(const char *name, void *value, size_t size);
+ struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(setprocattr, "selinux_setprocattr", my_setprocattr, 0);
+ 
++/*
++ * Fixed time budget for app writes to attr/current, in nanoseconds. The
++ * handler below has to branch on the payload, and both the policy lookup and
++ * the original handler take measurably different routes depending on it.
++ * Holding the whole path to a constant budget keeps that from being
++ * observable. Writes to attr/current from app uids are rare, so the cost is
++ * irrelevant; raise this if a build ever shows residual jitter.
++ */
++#define KSU_SETPROC_PAD_NS 10000ULL
++
+ typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
+ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+ {
      int error, perm_error;
      u32 mysid, sid;
      char *str = value;
 +    bool enforce;
 +    const char *probe;
 +    size_t probe_len;
++    u64 start = 0;
++    int ret;
      if (likely(current_uid().val < 10000)) {
          goto call_orig;
      }
-@@ -241,25 +244,46 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -241,29 +257,62 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
      if (strcmp(name, "current")) {
          goto call_orig;
      }
 -    if (size && str[0] && str[0] != '\n') {
++
++    start = local_clock();
 +
 +    if (!size || !str[0]) {
 +        goto call_orig;
@@ -64,7 +92,22 @@ index 033cab8..b76e76f 100644
  #endif
 -            return perm_error ?: error;
 -        }
-+        return perm_error ?: error;
++        ret = perm_error ?: error;
++        goto out;
      }
  
  call_orig:
+-    return ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
++    ret = ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
++
++out:
++    if (start) {
++        u64 deadline = start + KSU_SETPROC_PAD_NS;
++        while ((s64)(deadline - local_clock()) > 0) {
++            /* spin to the deadline */
++        }
++    }
++    return ret;
+ }
+ 
+ static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
